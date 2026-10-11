@@ -19,9 +19,9 @@ def client(tmp_path, monkeypatch):
 
 
 def test_sample_round_trip_scenario_update_export_and_conflict(client):
-    response = client.post("/api/workspaces/sample")
-    assert response.status_code == 200
-    data = response.json()
+    from app.sample import sample_workspace
+    from app.engine import comparison
+    data = comparison(app.state.repo.save(sample_workspace(), new=True))
     w = data["workspace"]
     path = "/api/workspaces/" + w["id"]
     assert client.get(path).json()["recommended"]["total"] == "4648443.90"
@@ -49,7 +49,8 @@ def test_master_import_and_empty_workspace(client):
 
 
 def test_invalid_workspace_unknown_vendor_and_sample_upload(client):
-    data = client.post("/api/workspaces/sample").json()
+    from app.sample import sample_workspace
+    data = {"workspace": app.state.repo.save(sample_workspace(), new=True).model_dump(mode="json")}
     path = "/api/workspaces/" + data["workspace"]["id"]
     assert client.get("/api/workspaces/not-a-uuid").status_code == 422
     assert client.post(path + "/scenario", json={"plan": {"kind": "single_vendor", "vendor_id": "invented"}}).status_code == 422

@@ -17,7 +17,7 @@ class Repository:
     def __init__(self):
         self.pool = None
         if settings.STORAGE_BACKEND == "postgres":
-            self.pool = ConnectionPool(settings.DATABASE_URL, min_size=0, max_size=5, timeout=15, kwargs={"connect_timeout": 10, "prepare_threshold": None}, open=False)
+            self.pool = ConnectionPool(settings.DATABASE_URL, min_size=0, max_size=5, timeout=15, check=ConnectionPool.check_connection, kwargs={"connect_timeout": 10, "prepare_threshold": None}, open=False)
             self.pool.open()
         else:
             Path(settings.SQLITE_PATH).parent.mkdir(parents=True, exist_ok=True)

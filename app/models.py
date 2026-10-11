@@ -15,6 +15,79 @@ class SKU(Model):
     ply: int | None = Field(default=None, ge=1, le=20)
     weight_kg: Decimal | None = Field(default=None, gt=0, le=1000)
     quantity: int | None = Field(default=None, gt=0, le=100_000_000)
+    pieces_per_box: Decimal | None = Field(default=None, gt=0, le=10000)
+
+
+class QualityQuestion(Model):
+    id: str = Field(min_length=1, max_length=80)
+    prompt: str = Field(min_length=1, max_length=500)
+    answer_type: Literal["yes_no", "number", "text"] = "yes_no"
+    required_for_qa: bool = True
+    expected_answer: str | None = None
+    minimum: Decimal | None = None
+    maximum: Decimal | None = None
+    requires_attachment: bool = False
+
+
+class VendorInvitation(Model):
+    name: str = Field(min_length=1, max_length=150)
+    email: str = Field(min_length=3, max_length=200)
+
+
+class RFx(Model):
+    title: str = Field(min_length=1, max_length=200)
+    scope: str = Field(min_length=1, max_length=5000)
+    skus: list[SKU] = Field(min_length=1, max_length=500)
+    questionnaire: list[QualityQuestion] = Field(min_length=1, max_length=30)
+    payment_terms: str = "Net 60 days"
+    delivery_terms: str = "Delivered to the stated buyer factories"
+    submission_instructions: str = "Reply in any format; include item codes, prices, units, freight and questionnaire evidence."
+    vendors: list[VendorInvitation] = Field(default_factory=list, max_length=10)
+    assumptions: list[str] = Field(default_factory=list, max_length=30)
+    quality_rules_approved: bool = False
+    status: Literal["draft", "issued"] = "draft"
+
+    @model_validator(mode="after")
+    def unique_fields(self):
+        for values in ([s.sku_id for s in self.skus], [q.id for q in self.questionnaire]):
+            if len(values) != len(set(values)):
+                raise ValueError("RFx item codes and question IDs must be unique.")
+        return self
+
+
+class QuestionnaireAnswer(Model):
+    question_id: str
+    answer: str | None = None
+    source_reference: str = ""
+    needs_review: bool = False
+
+
+class CurrencyConversion(Model):
+    currency: str = Field(min_length=3, max_length=3)
+    inr_per_unit: Decimal = Field(gt=0, le=1_000_000)
+    source: str = Field(min_length=1, max_length=300)
+    confirmed: bool = False
+
+
+class AttachedDocument(Model):
+    id: str
+    name: str
+    content_type: str
+    content_base64: str = ""
+    vendor_id: str | None = None
+    role: Literal["quotation", "supporting"] = "quotation"
+    question_ids: list[str] = Field(default_factory=list)
+    reviewed: bool = False
+    extracted_text: str = ""
+
+
+class OutboxMessage(Model):
+    id: str
+    vendor_name: str
+    recipient: str
+    subject: str
+    body: str
+    status: Literal["simulated"] = "simulated"
 
 
 class Rebate(Model):
@@ -41,7 +114,7 @@ class LineItem(Model):
     match_candidates: list[str] = Field(default_factory=list, max_length=20)
     source_evidence: dict[str, str] = Field(default_factory=dict)
     quoted_price: Decimal | None = Field(default=None, ge=0, le=1_000_000_000)
-    price_unit: Literal["per_box", "per_kg", "per_1000_boxes", "unknown"] = "unknown"
+    price_unit: Literal["per_box", "per_kg", "per_100_boxes", "per_100_pieces", "per_1000_boxes", "unknown"] = "unknown"
     notes_footnotes: str = Field(default="", max_length=4000)
     source_reference: str = Field(default="", max_length=4000)
     discount_percent: Decimal = Field(default=Decimal("0"), ge=0, le=100)
@@ -62,6 +135,7 @@ class Quote(Model):
     tax_percent: Decimal | None = Field(default=Decimal("0"), ge=0, le=100)
     commercial_terms_confirmed: bool = False
     certifications: list[str] = Field(default_factory=list, max_length=100)
+    questionnaire_answers: list[QuestionnaireAnswer] = Field(default_factory=list, max_length=30)
     source_evidence: dict[str, str] = Field(default_factory=dict)
     rebate: Rebate | None = None
     unmatched_items: list[LineItem] = Field(default_factory=list, max_length=500)
@@ -107,6 +181,12 @@ class Workspace(Model):
     quotes: list[Quote] = Field(default_factory=list, max_length=10)
     uploads: list[UploadRecord] = Field(default_factory=list, max_length=100)
     master_origin: Literal["buyer", "quotations", "sample"] = "buyer"
+    demo_mode: bool = False
+    rfx: RFx | None = None
+    documents: list[AttachedDocument] = Field(default_factory=list, max_length=40)
+    outbox: list[OutboxMessage] = Field(default_factory=list, max_length=10)
+    fx_rates: list[CurrencyConversion] = Field(default_factory=list, max_length=10)
+    analysis_history: list[dict] = Field(default_factory=list, max_length=30)
 
     @model_validator(mode="after")
     def unique_ids(self):
@@ -117,7 +197,7 @@ class Workspace(Model):
 
 
 class ScenarioPlan(Model):
-    kind: Literal["split_award", "lowest_per_sku", "single_vendor", "compare_vendors", "clarify"] = "split_award"
+    kind: Literal["split_award", "lowest_per_sku", "single_vendor", "compare_vendors", "quality_review", "coverage", "clarify"] = "split_award"
     qa_only: bool = True
     include_tax: bool = False
     excluded_vendor_ids: list[str] = Field(default_factory=list, max_length=10)

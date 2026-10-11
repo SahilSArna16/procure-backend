@@ -5,6 +5,7 @@ from itertools import combinations
 import pandas as pd
 
 from .models import Quote, ScenarioPlan, SKU, Workspace
+from .quality import qualification
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
@@ -14,41 +15,60 @@ def money(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def rates_for(sku: SKU, quote: Quote):
+def fx_factor(workspace: Workspace | None, currency: str):
+    if currency.upper() == "INR":
+        return ONE
+    if workspace:
+        rate = next((r for r in workspace.fx_rates if r.currency.upper() == currency.upper() and r.confirmed), None)
+        if rate:
+            return rate.inr_per_unit
+    return None
+
+
+def rates_for(sku: SKU, quote: Quote, workspace: Workspace | None = None):
     line = next((item for item in quote.line_items if item.sku_id == sku.sku_id), None)
     if line is None or line.quoted_price is None:
         return None, "Missing item or historical rate", line
     if line.needs_review or line.match_status in {"description", "uncertain", "unmatched"}:
         return None, "Item or match needs buyer review", line
-    if quote.currency.upper() != "INR" or (line.currency or quote.currency).upper() != "INR":
-        return None, "Currency conversion required", line
+    goods_fx = fx_factor(workspace, line.currency or quote.currency)
+    freight_fx = fx_factor(workspace, quote.currency)
+    if goods_fx is None or freight_fx is None:
+        return None, "Buyer-confirmed currency conversion required", line
     if line.price_unit == "unknown":
         return None, "Price unit unresolved", line
     if line.price_unit == "per_kg" and sku.weight_kg is None:
         return None, "Standard SKU weight required", line
     if line.freight_per_box is None:
         return None, "Per-box freight requires confirmation", line
-    if line.discount_conditions:
+    no_condition = line.discount_conditions.strip().casefold().rstrip(".") in {"", "none", "no discount", "no discounts", "n/a", "not applicable", "unconditional", "no conditions"}
+    if not no_condition:
         return None, "Conditional line discount needs buyer review", line
-    raw = line.quoted_price
+    raw = line.quoted_price * goods_fx
     if line.price_unit == "per_kg":
         raw *= sku.weight_kg
     elif line.price_unit == "per_1000_boxes":
         raw /= 1000
+    elif line.price_unit == "per_100_boxes":
+        raw /= 100
+    elif line.price_unit == "per_100_pieces":
+        if sku.pieces_per_box is None:
+            return None, "Buyer-approved pieces per box required", line
+        raw = raw / 100 * sku.pieces_per_box
     goods = raw * (ONE - line.discount_percent / 100)
-    return (raw, goods, line.freight_per_box), None, line
+    return (raw, goods, line.freight_per_box * freight_fx), None, line
 
 
-def rate_for(sku: SKU, quote: Quote):
-    rates, issue, line = rates_for(sku, quote)
+def rate_for(sku: SKU, quote: Quote, workspace: Workspace | None = None):
+    rates, issue, line = rates_for(sku, quote, workspace)
     return (rates[1] + rates[2] if rates else None), issue, line
 
 
 def normalized_frame(workspace: Workspace) -> pd.DataFrame:
-    return pd.DataFrame([{"sku_id": s.sku_id, "vendor_id": q.vendor_id, "rate": rate_for(s, q)[0]} for s in workspace.skus for q in workspace.quotes], columns=["sku_id", "vendor_id", "rate"])
+    return pd.DataFrame([{"sku_id": s.sku_id, "vendor_id": q.vendor_id, "rate": rate_for(s, q, workspace)[0]} for s in workspace.skus for q in workspace.quotes], columns=["sku_id", "vendor_id", "rate"])
 
 
-def rebate_for(quote: Quote, raw_goods: Decimal, net_goods: Decimal, freight: Decimal, awarded_ids: set[str], master_ids: set[str]):
+def rebate_for(quote: Quote, raw_goods: Decimal, net_goods: Decimal, freight: Decimal, awarded_ids: set[str], master_ids: set[str], currency_factor=ONE):
     rebate = quote.rebate
     result = {"status": "none", "applied": False, "percent": "0", "amount": "0.00", "reason": "No order rebate", "source_reference": rebate.source_reference if rebate else ""}
     if rebate is None or rebate.percent == 0:
@@ -64,7 +84,7 @@ def rebate_for(quote: Quote, raw_goods: Decimal, net_goods: Decimal, freight: De
     basis = {"base_goods": raw_goods, "net_goods": net_goods, "goods_and_freight": net_goods + freight}[rebate.threshold_basis]
     result["basis_value"] = money(basis)
     if rebate.minimum_order_value is not None:
-        qualifies = basis > rebate.minimum_order_value if rebate.threshold_operator == "gt" else basis >= rebate.minimum_order_value
+        qualifies = basis > rebate.minimum_order_value * currency_factor if rebate.threshold_operator == "gt" else basis >= rebate.minimum_order_value * currency_factor
         if not qualifies:
             result.update(status="below_threshold", reason=f"Order value does not {'exceed' if rebate.threshold_operator == 'gt' else 'reach'} INR {rebate.minimum_order_value}; no rebate applied")
             return result
@@ -73,12 +93,12 @@ def rebate_for(quote: Quote, raw_goods: Decimal, net_goods: Decimal, freight: De
     return result
 
 
-def invoice(quote: Quote, selected: list[SKU], quantities, prices, master_ids, include_tax=False):
+def invoice(quote: Quote, selected: list[SKU], quantities, prices, master_ids, include_tax=False, currency_factor=ONE):
     raw_goods = sum((prices[(s.sku_id, quote.vendor_id)][0] * quantities[s.sku_id] for s in selected), ZERO)
     net_goods = sum((prices[(s.sku_id, quote.vendor_id)][1] * quantities[s.sku_id] for s in selected), ZERO)
     per_box_freight = sum((prices[(s.sku_id, quote.vendor_id)][2] * quantities[s.sku_id] for s in selected), ZERO)
-    freight = per_box_freight + quote.freight_per_order
-    rebate = rebate_for(quote, raw_goods, net_goods, freight, {s.sku_id for s in selected}, master_ids)
+    freight = per_box_freight + quote.freight_per_order * currency_factor
+    rebate = rebate_for(quote, raw_goods, net_goods, freight, {s.sku_id for s in selected}, master_ids, currency_factor)
     factor = ONE - quote.rebate.percent / 100 if rebate["applied"] else ONE
     freight_factor = factor if rebate["applied"] and quote.rebate.applies_to == "goods_and_freight" else ONE
     tax_factor = ONE + quote.tax_percent / 100 if include_tax else ONE
@@ -99,23 +119,23 @@ def comparison(workspace: Workspace) -> dict:
     master_ids = {s.sku_id for s in workspace.skus}
     contexts = {}
     for quote in workspace.quotes:
-        prices = {(s.sku_id, quote.vendor_id): rates_for(s, quote)[0] for s in workspace.skus}
+        prices = {(s.sku_id, quote.vendor_id): rates_for(s, quote, workspace)[0] for s in workspace.skus}
         complete = bool(workspace.skus) and all(s.quantity is not None and prices[(s.sku_id, quote.vendor_id)] is not None for s in workspace.skus) and quote.freight_per_order is not None
         if complete:
             quantities = {s.sku_id: s.quantity for s in workspace.skus}
-            _, group, _ = invoice(quote, workspace.skus, quantities, prices, master_ids)
+            _, group, _ = invoice(quote, workspace.skus, quantities, prices, master_ids, currency_factor=fx_factor(workspace, quote.currency))
             total_boxes = sum(quantities.values())
             rebate = group["rebate"]
             factor = ONE - quote.rebate.percent / 100 if rebate["applied"] else ONE
             freight_factor = factor if rebate["applied"] and quote.rebate.applies_to == "goods_and_freight" else ONE
-            contexts[quote.vendor_id] = {"complete": True, "rebate": rebate, "goods_factor": factor, "freight_factor": freight_factor, "fixed_per_box": quote.freight_per_order / total_boxes, "total": group["total"]}
+            contexts[quote.vendor_id] = {"complete": True, "rebate": rebate, "goods_factor": factor, "freight_factor": freight_factor, "fixed_per_box": quote.freight_per_order * fx_factor(workspace, quote.currency) / total_boxes, "total": group["total"]}
         else:
             contexts[quote.vendor_id] = {"complete": False, "rebate": {"status": "unresolved", "applied": False, "reason": "Complete quantities and comparable rates required to evaluate the order rebate"}, "total": None}
     rows, issues = [], []
     for sku in workspace.skus:
         cells, comparable = {}, []
         for quote in workspace.quotes:
-            values, issue, line = rates_for(sku, quote)
+            values, issue, line = rates_for(sku, quote, workspace)
             context = contexts[quote.vendor_id]
             landed = None
             if values is not None and context["complete"]:
@@ -136,7 +156,11 @@ def comparison(workspace: Workspace) -> dict:
         rows.append({**sku.model_dump(mode="json"), "prices": cells, "lowest_vendor_ids": [vendor for rate, vendor in comparable if rate == lowest]})
     for quote in workspace.quotes:
         issues.extend({"sku_id": line.source_sku_id or line.sku_id, "vendor_id": quote.vendor_id, "message": "Source item has no confirmed unique master match"} for line in quote.unmatched_items)
-    return {"workspace": workspace.model_dump(mode="json"), "rows": rows, "issues": issues, "supplier_contexts": {identifier: {"complete": context["complete"], "total": context["total"], "rebate": context["rebate"]} for identifier, context in contexts.items()}, "single_vendor": calculate(workspace, ScenarioPlan(kind="compare_vendors")), "recommended": calculate(workspace, ScenarioPlan()), "stats": {"sku_count": len(workspace.skus), "vendor_count": len(workspace.quotes), "approved_vendor_count": sum(q.qa_passed is True for q in workspace.quotes), "total_quantity": sum(s.quantity or 0 for s in workspace.skus), "review_count": len(issues), "matched_item_count": sum(all(r["prices"][q.vendor_id]["match_status"] in {"sku", "confirmed"} for q in workspace.quotes) for r in rows) if workspace.quotes else 0}}
+    public_workspace = workspace.model_dump(mode="json")
+    for document in public_workspace["documents"]:
+        document.pop("content_base64", None)
+        document.pop("extracted_text", None)
+    return {"workspace": public_workspace, "quality": {q.vendor_id: qualification(workspace, q) for q in workspace.quotes}, "rows": rows, "issues": issues, "supplier_contexts": {identifier: {"complete": context["complete"], "total": context["total"], "rebate": context["rebate"]} for identifier, context in contexts.items()}, "single_vendor": calculate(workspace, ScenarioPlan(kind="compare_vendors")), "recommended": calculate(workspace, ScenarioPlan()), "stats": {"sku_count": len(workspace.skus), "vendor_count": len(workspace.quotes), "approved_vendor_count": sum(qualification(workspace, q)["passed"] is True for q in workspace.quotes), "total_quantity": sum(s.quantity or 0 for s in workspace.skus), "review_count": len(issues), "matched_item_count": sum(all(r["prices"][q.vendor_id]["match_status"] in {"sku", "confirmed"} for q in workspace.quotes) for r in rows) if workspace.quotes else 0}}
 
 
 def calculate(workspace: Workspace, plan: ScenarioPlan) -> dict:
@@ -147,10 +171,15 @@ def calculate(workspace: Workspace, plan: ScenarioPlan) -> dict:
         raise ValueError("Unknown vendor in the scenario.")
     if plan.kind == "clarify":
         return unavailable(plan.explanation or "Ask for split award or supplier comparison.", "clarify")
+    if plan.kind == "quality_review":
+        return {"status": "ok", "summary": "Qualification checks against buyer-approved RFx rules. Missing answers or unreviewed required evidence remain pending.", "quality": [{"vendor_name": q.vendor_name, "vendor_id": q.vendor_id, **qualification(workspace, q)} for q in workspace.quotes], "total": None, "awards": [], "plan": plan.model_dump(mode="json")}
+    if plan.kind == "coverage":
+        vendors = [{"vendor_name": q.vendor_name, "vendor_id": q.vendor_id, "quoted_skus": len([line for line in q.line_items if line.quoted_price is not None]), "missing_skus": [s.sku_id for s in workspace.skus if not any(l.sku_id == s.sku_id and l.quoted_price is not None for l in q.line_items)], "unmatched_rows": len(q.unmatched_items)} for q in workspace.quotes]
+        return {"status": "ok", "summary": "Coverage by item code, independent of row order. Missing rates and unmatched rows are explicit.", "coverage": vendors, "total": None, "awards": [], "plan": plan.model_dump(mode="json")}
     if not workspace.skus or any(s.quantity is None for s in workspace.skus):
         return unavailable("Confirm the master order quantities before calculating totals.", missing=[s.sku_id for s in workspace.skus if s.quantity is None])
     preview = plan.kind == "compare_vendors" and not plan.qa_only
-    eligible = [q for q in workspace.quotes if q.vendor_id not in plan.excluded_vendor_ids and (not plan.qa_only or q.qa_passed is True) and (q.commercial_terms_confirmed or preview) and q.freight_per_order is not None]
+    eligible = [q for q in workspace.quotes if q.vendor_id not in plan.excluded_vendor_ids and (not plan.qa_only or qualification(workspace, q)["passed"] is True) and (q.commercial_terms_confirmed or preview) and q.freight_per_order is not None]
     if plan.include_tax and any(q.tax_percent is None for q in eligible):
         raise ValueError("Tax rates are unknown for an eligible supplier. Confirm tax percentages before a tax-included calculation.")
     quantities = {}
@@ -162,7 +191,7 @@ def calculate(workspace: Workspace, plan: ScenarioPlan) -> dict:
     prices = {}
     for quote in eligible:
         for sku in workspace.skus:
-            values, _, _ = rates_for(sku, quote)
+            values, _, _ = rates_for(sku, quote, workspace)
             if values is not None:
                 prices[(sku.sku_id, quote.vendor_id)] = values
     master_ids = {s.sku_id for s in workspace.skus}
@@ -195,7 +224,7 @@ def calculate(workspace: Workspace, plan: ScenarioPlan) -> dict:
         for quote in vendors:
             if not selected[quote.vendor_id]:
                 continue
-            amount, group, vendor_lines = invoice(quote, selected[quote.vendor_id], quantities, prices, master_ids, plan.include_tax)
+            amount, group, vendor_lines = invoice(quote, selected[quote.vendor_id], quantities, prices, master_ids, plan.include_tax, fx_factor(workspace, quote.currency))
             total += amount
             groups.append(group)
             lines.extend(vendor_lines)
@@ -233,7 +262,7 @@ def calculate(workspace: Workspace, plan: ScenarioPlan) -> dict:
         if not r or not r.conditions_supported or r.percent == 0 or full_master_only or (r.minimum_order_value is None and not r.requires_all_skus):
             continue
         covered = [s for s in workspace.skus if (s.sku_id, q.vendor_id) in prices]
-        if covered and invoice(q, covered, quantities, prices, master_ids)[1]["rebate"]["applied"]:
+        if covered and invoice(q, covered, quantities, prices, master_ids, currency_factor=fx_factor(workspace, q.currency))[1]["rebate"]["applied"]:
             partial_rebates = True
     if partial_rebates and plan.kind == "split_award":
         options, lower = [], []

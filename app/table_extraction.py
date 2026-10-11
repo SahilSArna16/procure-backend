@@ -27,6 +27,10 @@ def unit(value):
     text = str(value or "").lower().replace("_", " ")
     if re.search(r"(?:/|per\s*|^)(?:1,?000|1000)\s*box", text):
         return "per_1000_boxes"
+    if re.search(r"(?:/|per\s*|^)\s*100\s*(?:pieces|pcs)", text):
+        return "per_100_pieces"
+    if re.search(r"(?:/|per\s*|^)\s*100\s*box", text):
+        return "per_100_boxes"
     if re.search(r"(?:/|per\s*)\s*(?:kg|kilogram)", text) or text.strip() in {"kg", "kilogram", "kilograms"}:
         return "per_kg"
     if re.search(r"(?:/|per\s*)\s*(?:box|carton)", text) or text.strip() in {"box", "boxes", "carton", "cartons"}:
@@ -94,6 +98,43 @@ def table_lines(filename, data, text):
     return result
 
 
+def explicit_freight_terms(text):
+    """Recognize source clauses before any model-generated amounts are validated."""
+    flattened = " ".join(text.split())
+    included = re.search(r"\bFreight\s+(?:is\s+)?included(?:\s+up\s+to\s+facility\s+doorstep)?\s*[.;](?!\s*(?:if|only|when|for orders))", flattened, re.I)
+    freight = re.search(r"Freight of INR\s+([\d,.]+)\s+per box is charged separately for every awarded box", flattened, re.I)
+    fixed = re.search(r"\bFreight\s+(?:of\s+)?INR\s+([\d,.]+)\s+per\s+(?:awarded\s+)?order\b", flattened, re.I)
+    no_variable = re.search(r"No per[- ]box freight charge|Fixed freight only", flattened, re.I)
+    if freight:
+        amount = numeric(freight.group(1))
+        if amount is not None:
+            return {"per_order": str(numeric(fixed.group(1))) if fixed else "0", "per_box": str(amount), "source_reference": freight.group(0)}
+    if fixed and numeric(fixed.group(1)) is not None:
+        return {"per_order": str(numeric(fixed.group(1))), "per_box": "0" if no_variable else None, "source_reference": fixed.group(0) + ("; " + no_variable.group(0) if no_variable else "")}
+    if included:
+        return {"per_order": "0", "per_box": "0", "source_reference": included.group(0)}
+    return None
+
+
+def apply_source_freight_to_output(raw, text):
+    """Replace only fields proven by an explicit source clause, never guess."""
+    freight = explicit_freight_terms(text)
+    if freight is None or not isinstance(raw, dict):
+        return raw
+    raw["freight_per_order"] = freight["per_order"]
+    if isinstance(raw.get("source_evidence"), dict):
+        raw["source_evidence"]["freight_per_order"] = freight["source_reference"]
+    items = raw.get("line_items")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                if freight["per_box"] is not None:
+                    item["freight_per_box"] = freight["per_box"]
+                if isinstance(item.get("source_evidence"), dict):
+                    item["source_evidence"]["freight_per_box"] = freight["source_reference"]
+    return raw
+
+
 def protect_explicit_terms(quote, text):
     """Recognize the supplied PDF's full rebate clause, not just its 5% number."""
     flattened = " ".join(text.split())
@@ -101,26 +142,26 @@ def protect_explicit_terms(quote, text):
     if stated_currency:
         quote.currency = stated_currency.group(1).upper()
         quote.source_evidence["currency"] = stated_currency.group(0)
-    included = re.search(r"Freight included up to facility doorstep\.", flattened, re.I)
-    if included:
-        quote.freight_per_order = Decimal("0")
-        quote.source_evidence["freight_per_order"] = included.group(0)
-        for line in quote.line_items:
-            line.freight_per_box = Decimal("0")
-            line.source_evidence["freight_per_box"] = included.group(0)
-    freight = re.search(r"Freight of INR\s+([\d,.]+)\s+per box is charged separately for every awarded box", flattened, re.I)
+    freight = explicit_freight_terms(text)
     if freight:
-        amount = numeric(freight.group(1))
+        quote.freight_per_order = Decimal(freight["per_order"])
+        quote.source_evidence["freight_per_order"] = freight["source_reference"]
         for line in quote.line_items:
-            line.freight_per_box = amount
-            line.source_evidence["freight_per_box"] = freight.group(0)
-        quote.freight_per_order = Decimal("0")
-        quote.source_evidence["freight_per_order"] = "Explicit freight clause charges each awarded box; no fixed order charge in this clause."
+            if freight["per_box"] is not None:
+                line.freight_per_box = Decimal(freight["per_box"])
+            line.source_evidence["freight_per_box"] = freight["source_reference"]
     clause = re.search(r"A\s+([\d.]+)% overall bill discount applies only if the base goods value across all\s+(\d+)\s+SKUs exceeds INR\s+([\d,]+)\s+in a single purchase order awarding all\s+\2\s+SKUs.*?discount applies to goods plus freight, before GST.*?No rebate applies to a partial award or at the exact threshold\.", flattened, re.I)
     if clause:
         quote.rebate = Rebate(percent=numeric(clause.group(1)), minimum_order_value=numeric(clause.group(3)), threshold_operator="gt", threshold_basis="base_goods", applies_to="goods_and_freight", requires_all_skus=True, conditions_supported=len(quote.line_items) == int(clause.group(2)), condition_text=clause.group(0), source_reference="Commercial footnote [3]: " + clause.group(0))
         for line in quote.line_items:
             # The footnote is an order rebate, never a blanket unconditional rate cut.
+            line.discount_percent = Decimal("0")
+            line.discount_conditions = ""
+        quote.source_evidence["rebate"] = quote.rebate.source_reference
+    goods_clause = re.search(r"([\d.]+)% goods rebate only if base goods value exceeds INR ([\d,]+) and all (\d+) SKUs are awarded in a single order\. No rebate for partial awards or exact threshold\. Freight not discounted\.", flattened, re.I)
+    if goods_clause:
+        quote.rebate = Rebate(percent=numeric(goods_clause.group(1)), minimum_order_value=numeric(goods_clause.group(2)), threshold_operator="gt", threshold_basis="base_goods", applies_to="goods", requires_all_skus=True, required_sku_ids=[line.sku_id for line in quote.line_items], conditions_supported=len(quote.line_items) == int(goods_clause.group(3)), condition_text=goods_clause.group(0), source_reference=goods_clause.group(0))
+        for line in quote.line_items:
             line.discount_percent = Decimal("0")
             line.discount_conditions = ""
         quote.source_evidence["rebate"] = quote.rebate.source_reference

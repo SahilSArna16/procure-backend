@@ -6,6 +6,7 @@ use the production code. The optional live script covers the provider boundary.
 """
 from decimal import Decimal
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from app.matching import match_quote
 from app.models import ExtractedQuote, LineItem, Quote, Rebate, SKU, ScenarioPlan, Workspace
 from app.table_extraction import table_lines, unit
 from app.parsers import parse_document
+from app.ai import AIError, structured
 
 FIXTURES = Path(__file__).parent / "fixtures" / "quotations"
 APEX_RATES = ["11.8", "12.2", "12.6", "13", "13.4", "13.8", "14.2", "14.6", "15", "15.4", "27.9", "28.4", "28.9", "29.4", "29.9", "30.4", "30.9", "31.4", "31.9", "32.4", "61.5", "62.4", "63.3", "64.2", "65.1", "66", "66.9", "67.8", "68.7", "69.6"]
@@ -92,6 +94,7 @@ def test_award_and_chat_use_both_quotes_with_exact_freight(client, monkeypatch):
         quote["commercial_terms_confirmed"] = True
     assert client.put(path, json=workspace).status_code == 200
     monkeypatch.setattr("app.main.plan_question", lambda _question, _workspace: ScenarioPlan(kind="split_award"))
+    monkeypatch.setattr("app.rfx.explain_analysis", lambda *_args: {"answer": "Computed award is shown in the table.", "observations": [], "caveats": []})
     award = client.post(path + "/scenario", json={"question": "Lowest-cost split award among suppliers that passed quality checks?"}).json()
     assert award["status"] == "ok"
     assert award["total"] == "21742500.00"
@@ -205,3 +208,26 @@ def test_dimensionless_workbook_still_enforces_actual_row_limit():
     book.save(output)
     with pytest.raises(ValueError, match="5,000 rows"):
         parse_document("too-large.xlsx", output.getvalue())
+
+
+def test_source_freight_is_applied_before_model_schema_validation(monkeypatch):
+    raw = {
+        "vendor_id": "pending", "vendor_name": "Apex",
+        "freight_per_order": {"amount": "1.80", "unit": "per_box"},
+        "source_evidence": {},
+        "line_items": [{"sku_id": "SKU-001", "quoted_price": "11.80", "price_unit": "per_box", "freight_per_box": "INR 1.80 per box", "source_evidence": {}}],
+    }
+    monkeypatch.setattr(settings, "SARVAM_KEY", "test-key")
+    monkeypatch.setattr("app.ai.request", lambda *_args, **_kwargs: {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(raw)}}]})
+    text = "Freight of INR 1.80 per box is charged separately for every awarded box."
+    quote = structured("Extract source values", {"document": text}, ExtractedQuote)
+    assert quote.freight_per_order == Decimal("0")
+    assert quote.line_items[0].freight_per_box == Decimal("1.80")
+    assert "1.80 per box" in quote.source_evidence["freight_per_order"]
+    # An invalid model amount with no proving source clause must still fail.
+    with pytest.raises(AIError, match="freight_per_order"):
+        structured("Extract source values", {"document": "Freight not stated."}, ExtractedQuote)
+    # Fixing freight does not bypass validation for other extracted fields.
+    raw["line_items"][0]["quoted_price"] = "not a price"
+    with pytest.raises(AIError, match="quoted_price"):
+        structured("Extract source values", {"document": text}, ExtractedQuote)

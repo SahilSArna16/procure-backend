@@ -1,6 +1,9 @@
 import csv
 import io
 import logging
+import base64
+import mimetypes
+import json
 from hashlib import sha256
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,7 +17,7 @@ from pydantic import ValidationError
 from . import settings
 from .ai import AIError, extract_quote, plan_question
 from .engine import calculate, comparison
-from .models import SKU, ScenarioRequest, UploadRecord, Workspace
+from .models import AttachedDocument, SKU, ScenarioRequest, UploadRecord, Workspace
 from .matching import extend_master, match_quote
 from .parsers import MAX_FILE_BYTES
 from .repository import ConflictError, Repository
@@ -61,7 +64,8 @@ def health():
 
 @app.post("/api/workspaces/sample")
 def create_sample():
-    return comparison(app.state.repo.save(sample_workspace(), new=True))
+    from .assessment_demo import demo_workspace
+    return comparison(app.state.repo.save(demo_workspace(), new=True))
 
 
 @app.post("/api/workspaces")
@@ -92,6 +96,25 @@ def update_workspace(workspace_id: UUID, workspace: Workspace):
         raise HTTPException(422, "Workspace ID cannot be changed.")
     if workspace.revision != existing.revision:
         raise ConflictError("Comparison changed. Reload before saving.")
+    if workspace.rfx:
+        before = [s.model_dump(mode="json") for s in existing.skus]
+        posted = [s.model_dump(mode="json") for s in workspace.skus]
+        rfx_posted = [s.model_dump(mode="json") for s in workspace.rfx.skus]
+        if posted != before and rfx_posted == before:
+            workspace.rfx.skus = workspace.skus
+        elif posted == before and rfx_posted != before:
+            workspace.skus = workspace.rfx.skus
+        elif posted != rfx_posted:
+            raise HTTPException(422, "Keep RFx and master item specifications consistent.")
+    # Originals are immutable and never exposed as base64 in API responses.
+    requested_docs = {d.id: d for d in workspace.documents}
+    known_questions = {q.id for q in workspace.rfx.questionnaire} if workspace.rfx else set()
+    for document in existing.documents:
+        requested = requested_docs.get(document.id)
+        if requested and requested.question_ids != document.question_ids and any(i not in known_questions for i in requested.question_ids):
+            raise HTTPException(422, "Link evidence to a question in the current RFx.")
+    workspace.documents = [d.model_copy(update={"reviewed": requested_docs[d.id].reviewed, "question_ids": requested_docs[d.id].question_ids}) if d.id in requested_docs else d for d in existing.documents]
+    workspace.analysis_history = existing.analysis_history
     known = {s.sku_id for s in workspace.skus}
     if any(line.sku_id not in known for q in workspace.quotes for line in q.line_items):
         raise HTTPException(422, "Quotes contain SKUs outside the master. Resolve these before saving.")
@@ -151,6 +174,7 @@ def upload_quotes(workspace_id: UUID, files: list[UploadFile] = File(...), retry
                 if not latest.skus:
                     raise ValueError("No explicit item codes available to build a master. Import a master CSV, then retry.")
                 latest.quotes.append(quote)
+                latest.documents.append(AttachedDocument(id=str(uuid4()), name=filename, content_type=mimetypes.guess_type(filename)[0] or "application/octet-stream", content_base64=base64.b64encode(data).decode("ascii"), vendor_id=quote.vendor_id, role="quotation"))
                 record.status = "completed"
                 record.vendor_id = quote.vendor_id
                 record.matched_count = sum(line.match_status in {"sku", "confirmed"} for line in quote.line_items)
@@ -181,7 +205,20 @@ def upload_quotes(workspace_id: UUID, files: list[UploadFile] = File(...), retry
 def scenario(workspace_id: UUID, body: ScenarioRequest):
     workspace = load(workspace_id)
     try:
-        return calculate(workspace, body.plan or plan_question(body.question, workspace))
+        result = calculate(workspace, body.plan or plan_question(body.question, workspace))
+        if body.question.strip() and body.plan is None:
+            from .rfx import explain_analysis
+            try:
+                result["narrative"] = explain_analysis(body.question, workspace, result)
+            except AIError as error:
+                result["narrative_error"] = str(error)
+            from datetime import datetime, timezone
+            result["calculation_revision"] = workspace.revision
+            turn = {"question": body.question, "result": result, "created_at": datetime.now(timezone.utc).isoformat()}
+            def append_history(latest):
+                latest.analysis_history = (latest.analysis_history + [turn])[-30:]
+            change_upload(workspace_id, append_history)
+        return result
     except AIError as error:
         raise HTTPException(502, str(error)) from None
     except ValueError as error:
@@ -234,7 +271,14 @@ def export_comparison(workspace_id: UUID):
         rows.append([row["sku_id"], row["description"], row["factory"], row["weight_kg"], row["quantity"], *values])
     rows.extend([[], ["Vendor", "QA", "Commercial terms confirmed", "Payment terms", "Fixed freight INR/order", "Tax %", "Notes"]])
     for q in workspace.quotes:
-        rows.append([q.vendor_name, q.qa_passed, q.commercial_terms_confirmed, q.payment_terms, q.freight_per_order, q.tax_percent, " | ".join(q.notes)])
+        rows.append([q.vendor_name, result["quality"][q.vendor_id]["status"], q.commercial_terms_confirmed, q.payment_terms, q.freight_per_order, q.tax_percent, " | ".join(q.notes)])
+    rows.extend([[], ["Supplier", "Quality question", "Answer", "Status", "Reason", "Source evidence"]])
+    for q in workspace.quotes:
+        for check in result["quality"][q.vendor_id]["checks"]:
+            rows.append([q.vendor_name, check["prompt"], check["answer"], check["status"], check["reason"], check["source_reference"]])
+    rows.extend([[], ["Currency", "INR per unit", "Confirmed", "Rate source"]])
+    for rate in workspace.fx_rates:
+        rows.append([rate.currency, rate.inr_per_unit, rate.confirmed, rate.source])
     rows.extend([[], ["Scenario: approved vendors, confirmed terms, fixed freight included, GST excluded"], ["Vendor", "SKUs", "Quantity", "Subtotal INR", "Freight INR", "Total INR"]])
     for a in result["recommended"]["awards"]:
         rows.append([a["vendor_name"], a["sku_count"], a["quantity"], a["subtotal"], a["freight"], a["total"]])
@@ -266,3 +310,138 @@ def comparison_test_files():
         for name in names:
             archive.write(folder / name, arcname=name)
     return Response(output.getvalue(), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="quotation-test-pack.zip"'})
+
+
+@app.post("/api/workspaces/{workspace_id}/rfx/draft")
+def rfx_draft(workspace_id: UUID, body: dict):
+    from .rfx import DraftRequest, draft_rfx
+    try:
+        request = DraftRequest.model_validate(body)
+        workspace = load(workspace_id)
+        draft = draft_rfx(workspace, request.message)
+        workspace.rfx = draft.rfx
+        workspace.skus = draft.rfx.skus
+        saved = app.state.repo.save(workspace)
+        return {"comparison": comparison(saved), "explanation": draft.explanation}
+    except (AIError, ValueError) as error:
+        raise HTTPException(422, str(error)) from None
+
+
+@app.post("/api/workspaces/{workspace_id}/rfx/distribute")
+def rfx_distribute(workspace_id: UUID):
+    from .rfx import simulated_distribution
+    try:
+        workspace = simulated_distribution(load(workspace_id))
+        return comparison(app.state.repo.save(workspace))
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
+
+
+@app.get("/api/workspaces/{workspace_id}/rfx/export")
+def rfx_export(workspace_id: UUID):
+    from .rfx import packet_text
+    workspace = load(workspace_id)
+    try:
+        text = packet_text(workspace)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
+    return Response(text, media_type="text/plain", headers={"Content-Disposition": 'attachment; filename="rfx-packet.txt"'})
+
+
+@app.get("/api/workspaces/{workspace_id}/outbox/{message_id}")
+def download_outbox(workspace_id: UUID, message_id: UUID):
+    from email.message import EmailMessage
+    workspace = load(workspace_id)
+    item = next((m for m in workspace.outbox if m.id == str(message_id)), None)
+    if not item:
+        raise HTTPException(404, "Outbox entry not found.")
+    message = EmailMessage()
+    message["From"] = "buyer@procure.example"
+    message["To"] = item.recipient
+    message["Subject"] = item.subject
+    message["X-Procure-Transport"] = "Simulated; not transmitted"
+    message.set_content(item.body)
+    return Response(message.as_bytes(), media_type="message/rfc822", headers={"Content-Disposition": 'attachment; filename="simulated-invitation.eml"'})
+
+
+@app.post("/api/workspaces/{workspace_id}/supporting-documents")
+def supporting_document(workspace_id: UUID, vendor_id: str = Form(...), question_ids: str = Form("[]"), file: UploadFile = File(...)):
+    from .ai import ocr
+    from .parsers import parse_document
+    workspace = load(workspace_id)
+    if not any(q.vendor_id == vendor_id for q in workspace.quotes):
+        raise HTTPException(422, "Select a supplier in this comparison.")
+    try:
+        ids = json.loads(question_ids)
+        known = {q.id for q in workspace.rfx.questionnaire} if workspace.rfx else set()
+        if not isinstance(ids, list) or any(not isinstance(i, str) or i not in known for i in ids):
+            raise ValueError("Select valid questionnaire questions for this evidence.")
+        data = file.file.read(MAX_FILE_BYTES + 1)
+        name = Path(file.filename or "evidence").name[:200]
+        text = parse_document(name, data)
+        if text is None:
+            text = ocr(name, data)
+        document = AttachedDocument(id=str(uuid4()), name=name, content_type=mimetypes.guess_type(name)[0] or "application/octet-stream", content_base64=base64.b64encode(data).decode("ascii"), vendor_id=vendor_id, role="supporting", question_ids=ids, extracted_text=text)
+        def append(latest):
+            if len(latest.documents) >= 40:
+                raise ValueError("Document limit reached.")
+            latest.documents.append(document)
+        saved = change_upload(workspace_id, append)
+        return comparison(saved)
+    except (ValueError, AIError) as error:
+        raise HTTPException(422, str(error)) from None
+    finally:
+        file.file.close()
+
+
+@app.get("/api/workspaces/{workspace_id}/documents/{document_id}")
+def original_document(workspace_id: UUID, document_id: UUID):
+    from urllib.parse import quote as escape_filename
+    workspace = load(workspace_id)
+    document = next((d for d in workspace.documents if d.id == str(document_id)), None)
+    if not document:
+        raise HTTPException(404, "Document not found.")
+    return Response(base64.b64decode(document.content_base64), media_type=document.content_type, headers={"Content-Disposition": "attachment; filename*=UTF-8''" + escape_filename(document.name, safe=""), "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/api/assessment-demo/manifest")
+def demo_manifest():
+    from .assessment_demo import QUOTE_NAMES, CERT_NAMES
+    return {"quotations": QUOTE_NAMES, "supporting_documents": CERT_NAMES, "synthetic": True, "extraction": "Live Sarvam requests; no pre-extracted answers"}
+
+
+@app.get("/api/assessment-demo/file")
+def demo_file(name: str):
+    from .assessment_demo import make_files
+    files = make_files()
+    if name not in files:
+        raise HTTPException(404, "Demo input not found.")
+    return Response(files[name], media_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
+
+
+@app.get("/api/assessment-demo/download")
+def download_assessment_demo():
+    from .assessment_demo import demo_zip
+    return Response(demo_zip(), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="assessment-five-vendor-inputs.zip"'})
+
+
+@app.post("/api/workspaces/{workspace_id}/quotes/{vendor_id}/questionnaire/refresh")
+def refresh_questionnaire(workspace_id: UUID, vendor_id: str):
+    from .rfx import refresh_answers
+    try:
+        workspace = refresh_answers(load(workspace_id), vendor_id)
+        return comparison(app.state.repo.save(workspace))
+    except (ValueError, AIError) as error:
+        raise HTTPException(422, str(error)) from None
+
+
+@app.post("/api/workspaces/{workspace_id}/quotes/{vendor_id}/source-reconcile")
+def reconcile_source_terms(workspace_id: UUID, vendor_id: str):
+    from .table_extraction import protect_explicit_terms
+    workspace = load(workspace_id)
+    quote = next((q for q in workspace.quotes if q.vendor_id == vendor_id), None)
+    if quote is None:
+        raise HTTPException(404, "Quotation not found.")
+    protect_explicit_terms(quote, quote.source_text)
+    quote.commercial_terms_confirmed = False
+    return comparison(app.state.repo.save(workspace))
