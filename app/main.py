@@ -31,7 +31,7 @@ async def lifespan(application: FastAPI):
 
 
 app = FastAPI(title="Procure · Procurement Assistant", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"], allow_methods=["GET", "POST", "PUT"], allow_headers=["Content-Type"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_methods=["GET", "POST", "PUT"], allow_headers=["Content-Type"])
 
 
 @app.exception_handler(ConflictError)
